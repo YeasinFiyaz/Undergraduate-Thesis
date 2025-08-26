@@ -1,0 +1,59 @@
+# ======= Install dependencies =======
+!pip install torch torchvision pydicom torchxrayvision --quiet
+
+# ======= Imports =======
+import torch
+import torchxrayvision as xrv
+import pydicom
+import numpy as np
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+print("Device:", DEVICE)
+
+# ======= Load pretrained DenseNet-121 =======
+model = xrv.models.DenseNet(weights="densenet121-res224-all")
+model = model.to(DEVICE)
+model.eval()
+labels = model.pathologies
+
+# ======= Load DICOM =======
+dicom_path = "/content/A038686.dcm"
+ds = pydicom.dcmread(dicom_path, force=True)
+img = ds.pixel_array.astype(np.float32)
+slope = float(getattr(ds, "RescaleSlope", 1.0))
+intercept = float(getattr(ds, "RescaleIntercept", 0.0))
+img = img * slope + intercept
+
+# ======= Clip and normalize =======
+lo, hi = np.percentile(img, [1, 99])
+img = np.clip(img, lo, hi)
+img = (img - lo) / max(hi - lo, 1e-6)  # Normalize to [0,1]
+
+# ======= Preprocess =======
+img = np.expand_dims(img, 0)           # [1,H,W] single channel
+img = xrv.datasets.XRayCenterCrop()(img)
+img = xrv.datasets.XRayResizer(224)(img)
+img = xrv.datasets.normalize(img, maxval=1.0)  # normalized to [-1,1]
+
+tensor = torch.from_numpy(img).unsqueeze(0).to(DEVICE)  # [1,1,224,224]
+
+# ======= Inference =======
+with torch.no_grad():
+    logits = model(tensor)
+    probs = torch.sigmoid(logits)[0].cpu().numpy()
+
+# ======= Display top findings =======
+paired = sorted(zip(labels, probs), key=lambda x: x[1], reverse=True)
+print("\nTop medical predictions:")
+for name, prob in paired[:10]:
+    print(f"{name:25s} : {prob:0.3f}")
+
+# Alerts above threshold
+threshold = 0.5
+alerts = [(n,p) for n,p in paired if p >= threshold]
+if alerts:
+    print(f"\nALERTS (prob >= {threshold}):")
+    for n,p in alerts:
+        print(f"  -> {n:25s} : {p:0.3f}")
+else:
+    print("\nNo alerts above threshold")
